@@ -6,6 +6,9 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from metadrive import MetaDriveEnv
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+import torch.nn as nn
+import torch
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -19,15 +22,36 @@ MODEL_NAME      = "ppo_metadrive_phase1"
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+class DrivingMLP(BaseFeaturesExtractor):
+    def __init__(self, observation_space, features_dim=128):
+        super().__init__(observation_space, features_dim)
+        
+        input_dim = observation_space.shape[0]  # lidar/sensor vector size
+        
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            # nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, features_dim),
+            nn.ReLU(),
+        )
+    
+    def forward(self, obs):
+        return self.network(obs)
+
 def make_env():
     def _init():
         env = MetaDriveEnv(config={
             "use_render":              True,   # headless = faster training
-            "num_scenarios":           10,      # variety of tracks
-            "traffic_density":         0.0,     # no traffic in phase 1
-            "accident_prob":           0.0,
-            "map":                     "SSSSSSSS",  # simple straight roads
-            "random_lane_width":       False,
+            "num_scenarios":           20,      # variety of tracks
+            "traffic_density":         0.2,     # no traffic in phase 1
+            "accident_prob":           0.2,
+            "map":                     "SCSCSCS",  # simple straight roads
+            "random_lane_width":       True,
             "random_agent_model":      False,
             # "vehicle_config": {
             #     "use_saver":           False,
@@ -61,17 +85,24 @@ def train():
     vec_env = DummyVecEnv([make_env()])
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True)
 
-    # Eval environment (separate, not normalized by same stats)
-    eval_env = DummyVecEnv([make_env()])
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+    # # Eval environment (separate, not normalized by same stats)
+    # eval_env = DummyVecEnv([make_env()])
+    # eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
+    
+    policy_kwargs = dict(
+        features_extractor_class  = DrivingMLP,
+        features_extractor_kwargs = dict(features_dim=128),
+        net_arch                  = [64, 64],  # layers AFTER your extractor → action
+    )
 
     # PPO Agent
     model = PPO(
         policy          = "MlpPolicy",   # vector obs → MLP → actions
         env             = vec_env,
+        policy_kwargs=policy_kwargs,
         learning_rate   = 3e-4,
-        n_steps         = 2048,          # steps per env before update
-        batch_size      = 64,
+        n_steps         = 4096,          # steps per env before update
+        batch_size      = 128,
         n_epochs        = 10,
         gamma           = 0.99,          # discount factor
         gae_lambda      = 0.95,
@@ -89,16 +120,16 @@ def train():
         verbose     = 1,
     )
 
-    # Evaluate agent every 50k steps, save best model
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path = os.path.join(MODEL_DIR, "best"),
-        log_path             = LOG_DIR,
-        eval_freq            = 50_000,
-        n_eval_episodes      = 5,
-        deterministic        = True,
-        verbose              = 1,
-    )
+    # # Evaluate agent every 50k steps, save best model
+    # eval_callback = EvalCallback(
+    #     eval_env,
+    #     best_model_save_path = os.path.join(MODEL_DIR, "best"),
+    #     log_path             = LOG_DIR,
+    #     eval_freq            = 50_000,
+    #     n_eval_episodes      = 5,
+    #     deterministic        = True,
+    #     verbose              = 1,
+    # )
 
     print("🚗 Starting Phase 1 Training...\n")
     print(f"   Total timesteps : {TOTAL_TIMESTEPS:,}")
@@ -109,7 +140,8 @@ def train():
 
     model.learn(
         total_timesteps = TOTAL_TIMESTEPS,
-        callback        = [checkpoint_callback, eval_callback],
+        # callback        = [checkpoint_callback, eval_callback],
+        callback        = checkpoint_callback,
         progress_bar    = True,
     )
 
@@ -139,7 +171,7 @@ def evaluate():
         vec_env.norm_reward = False
 
     # Load best model
-    best_path = os.path.join(MODEL_DIR, "best", "best_model")
+    best_path = os.path.join(MODEL_DIR, "best", "best")
     model = PPO.load(best_path, env=vec_env)
 
     obs = vec_env.reset()
