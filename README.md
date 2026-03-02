@@ -2,6 +2,8 @@
 
 > Training a vision-based autonomous driving agent using Reinforcement Learning from Human Feedback (RLHF), where humans guide the agent using natural language instead of manual reward engineering.
 
+![MetaDrive home screen](Images/Metadrive_home_screen.png)
+
 ---
 
 ## 📌 Project Overview
