@@ -39,7 +39,7 @@ DriveAlign-RLHF-NavCar/
 │   ├── feedback.py                # Phase 4 - LLM feedback labelling (Mistral)
 │   └── reward_modeling.py         # Phase 5 - GPT-2 reward model training
 │
-├── run.py                         # Combined Phase 3+4 live recording + feedback
+├── data_collection.py                         # Combined Phase 3+4 live recording + feedback
 ├── fine_tune_with_reward_model.py # Phase 6 - RLHF fine-tuning
 │
 ├── models/                        # Saved Phase 1 model checkpoints
@@ -180,7 +180,7 @@ These segments are what the LLM will later review and label in Phase 4.
 
 ### Phase 4 - LLM Feedback Layer ✅
 
-**Key design decision:** Phase 3 and Phase 4 run together in `run.py`. The agent drives live in a render window while the human watches. After each segment the terminal prints what just happened and asks for feedback:
+**Key design decision:** Phase 3 and Phase 4 run together in `data_collection.py`. The agent drives live in a render window while the human watches. After each segment the terminal prints what just happened and asks for feedback:
 
 ```
 📊 SEGMENT SUMMARY - What just happened:
@@ -374,7 +374,7 @@ tensorboard --logdir ./logs_vision/
 
 ```bash
 # Watch agent drive live + give feedback after each segment
-python run.py
+python data_collection.py
 
 # Review all labelled segments after
 python src/feedback.py review
