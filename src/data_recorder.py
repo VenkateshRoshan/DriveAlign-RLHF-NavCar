@@ -7,14 +7,19 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from metadrive import MetaDriveEnv
-from metadrive.component.sensors.rgb_camera import RGBCamera
+from helpers import (
+    PHASE2_MODEL_NAME,
+    PHASE2_VECNORM_FILENAME,
+    N_STACK,
+    StateStackWrapper,
+    SmoothnessWrapper,
+    compute_reward_features,
+    get_env_config,
+)
 
 MODEL_DIR       = "./models_vision/"
-MODEL_NAME      = "ppo_metadrive_vision"
+MODEL_NAME      = PHASE2_MODEL_NAME
 SEGMENTS_DIR    = "./segments/"
-
-IMAGE_HEIGHT    = 84
-IMAGE_WIDTH     = 84
 
 SEGMENT_LENGTH  = 50        # how many steps per segment (~10 seconds at 10Hz)
 NUM_SEGMENTS    = 50         # total segments to record
@@ -22,30 +27,11 @@ RENDER          = False      # set True if you want to watch while recording
 
 os.makedirs(SEGMENTS_DIR, exist_ok=True)
 
-def get_env_config(render=False):
-    return {
-        "use_render":          render,
-        "num_scenarios":       20,
-        "traffic_density":     0.2,
-        "accident_prob":       0.2,
-        "map":                 "SCSCSCS",
-        "random_lane_width":   True,
-        "random_agent_model":  False,
-        "stack_size":          1,
-        "image_observation":   True,
-        "norm_pixel":          True,
-        "sensors": {
-            "rgb_camera": (RGBCamera, IMAGE_WIDTH, IMAGE_HEIGHT)
-        },
-        "vehicle_config": {
-            "image_source": "rgb_camera"
-        },
-        "interface_panel":     [],
-    }
-
 def make_env(render=False):
     def _init():
         env = MetaDriveEnv(config=get_env_config(render=render))
+        # env = SmoothnessWrapper(env)
+        env = StateStackWrapper(env, n_stack=N_STACK)
         env = Monitor(env)
         return env
     return _init
@@ -110,65 +96,6 @@ class SegmentRecorder:
             "out_of_road":         bool(out_of_road),
         }
 
-    def generate_description(self, summary):
-        """
-        Auto-generate a plain English description of the segment.
-        This is what the LLM will read in Phase 4.
-        """
-        speed      = summary["avg_speed"]
-        lane_dev   = summary["avg_lane_deviation"]
-        smoothness = summary["steering_smoothness"]
-        crashed    = summary["crashed"]
-        oor        = summary["out_of_road"]
-
-        # Speed description
-        if speed < 3.0:
-            speed_desc = "very slow"
-        elif speed < 6.0:
-            speed_desc = "moderate speed"
-        elif speed < 10.0:
-            speed_desc = "good speed"
-        else:
-            speed_desc = "very fast"
-
-        # Lane discipline
-        if lane_dev < 0.1:
-            lane_desc = "staying well within the lane"
-        elif lane_dev < 0.3:
-            lane_desc = "slight lane deviation"
-        elif lane_dev < 0.6:
-            lane_desc = "significant lane deviation"
-        else:
-            lane_desc = "severe lane deviation"
-
-        # Smoothness
-        if smoothness < 0.05:
-            smooth_desc = "very smooth steering"
-        elif smoothness < 0.15:
-            smooth_desc = "mostly smooth steering"
-        elif smoothness < 0.3:
-            smooth_desc = "somewhat jerky steering"
-        else:
-            smooth_desc = "very aggressive/jerky steering"
-
-        # Incidents
-        if crashed:
-            incident = "The agent crashed."
-        elif oor:
-            incident = "The agent went out of road."
-        else:
-            incident = "No incidents."
-
-        description = (
-            f"The agent drove at {speed_desc} (avg {speed:.1f} m/s) "
-            f"with {lane_desc} (avg deviation {lane_dev:.2f}m). "
-            f"Steering was {smooth_desc} (smoothness score {smoothness:.3f}). "
-            f"{incident} "
-            f"Total reward for this segment: {summary['total_reward']:.2f}."
-        )
-
-        return description
-
     def flush(self, crashed=False, out_of_road=False):
         """
         Save the buffered segment to disk and return the segment ID.
@@ -176,7 +103,7 @@ class SegmentRecorder:
           - states.npy    → state vectors at each step
           - actions.npy   → actions at each step
           - rewards.npy   → rewards at each step
-          - stats.json    → summary stats + text description
+          - stats.json    → numeric summary + features
         """
         segment_id  = str(uuid.uuid4())[:8]
         segment_dir = os.path.join(self.save_dir, f"seg_{segment_id}")
@@ -188,15 +115,19 @@ class SegmentRecorder:
         np.save(os.path.join(segment_dir, "rewards.npy"), np.array(self.rewards))
 
         # Compute and save stats
-        summary     = self.compute_summary(crashed, out_of_road)
-        description = self.generate_description(summary)
+        summary = self.compute_summary(crashed, out_of_road)
+        reward_features = compute_reward_features(
+            np.array(self.states),
+            np.array(self.actions),
+            crashed=crashed,
+            out_of_road=out_of_road,
+        )
 
         stats = {
-            "segment_id":  segment_id,
-            "summary":     summary,
-            "description": description,
-            "label":       None,      # ← Phase 4 will fill this
-            "llm_reason":  None,      # ← Phase 4 will fill this
+            "segment_id":       segment_id,
+            "summary":          summary,
+            "reward_features":  reward_features.tolist(),
+            "score":            None,      # filled manually
         }
 
         with open(os.path.join(segment_dir, "stats.json"), "w") as f:
@@ -209,7 +140,7 @@ class SegmentRecorder:
 
 def load_model():
     vec_env   = DummyVecEnv([make_env(render=RENDER)])
-    norm_path = os.path.join(MODEL_DIR, "vecnormalize.pkl")
+    norm_path = os.path.join(MODEL_DIR, PHASE2_VECNORM_FILENAME)
 
     if os.path.exists(norm_path):
         vec_env = VecNormalize.load(norm_path, vec_env)
@@ -217,7 +148,7 @@ def load_model():
         vec_env.norm_reward = False
         print("  ✅ VecNormalize loaded")
     else:
-        print("  ⚠️  No vecnormalize.pkl found, running without normalization")
+        print(f"  ⚠️  No {PHASE2_VECNORM_FILENAME} found, running without normalization")
 
     final_path = os.path.join(MODEL_DIR, MODEL_NAME + "_final")
     model      = PPO.load(final_path, env=vec_env)
@@ -314,7 +245,7 @@ def record():
     print(f"   Avg reward      : {np.mean(all_rewards):.2f}")
     print(f"   Best segment    : {np.max(all_rewards):.2f}")
     print(f"   Worst segment   : {np.min(all_rewards):.2f}")
-    print(f"\n🚀 Ready for Phase 4 — LLM Feedback Layer\n")
+    print(f"\n🚀 Ready for Phase 4 — Manual Numeric Labelling\n")
 
 def inspect_segment(segment_id=None):
     """
@@ -352,9 +283,9 @@ def inspect_segment(segment_id=None):
     print(f"\n  Summary:")
     for k, v in stats["summary"].items():
         print(f"    {k:<25}: {v}")
-    print(f"\n  Description (what LLM will read):")
-    print(f"  \"{stats['description']}\"")
-    print(f"\n  Label         : {stats['label']}  (None = not yet labelled by LLM)")
+    print(f"\n  Reward features:")
+    print(f"  {stats.get('reward_features')}")
+    print(f"\n  Score         : {stats.get('score')}  (None = not yet labelled)")
 
 if __name__ == "__main__":
     import sys
